@@ -1,0 +1,1 @@
+ALTER TABLE "memory_facts" ALTER COLUMN "embedding" SET DATA TYPE jsonb;

@@ -4,9 +4,14 @@ Collaborative AI work sessions for teams. Build order follows `multiplayer-ai-de
 
 ## Local setup
 
-1. Copy `.env.example` → `.env.local` and set `DATABASE_URL`.
-2. Run migrations: `npm run db:migrate`
-3. Start the app: `npm run dev`
+1. Copy `.env.example` → `.env.local` and set `DATABASE_URL`. Keep `MOCK_AI_RESPONSES=true` until you have an Anthropic key.
+2. Ensure Redis is running (`redis-cli ping` → `PONG`). Default `REDIS_URL=redis://127.0.0.1:6379`.
+3. Run migrations: `npm run db:migrate`
+4. Start the app: `npm run dev`
+5. (Optional) For scheduled handoff briefs: run `npx inngest-cli@latest dev` and sync `/api/inngest`. On-demand handoff works without Inngest.
+6. (Optional) Tool Mesh GitHub Connect: set `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `APP_URL` (see `.env.example`). Permission gating works without OAuth via `/settings/tools` → Add GitHub tool.
+
+See `VERIFICATION_STATUS.md` for which Phase 1 steps still need a real API key re-check.
 
 ## Security TODOs (before any real deployment)
 

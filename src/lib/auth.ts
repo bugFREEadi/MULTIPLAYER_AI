@@ -1,10 +1,21 @@
+import "server-only";
+
 import { auth, currentUser } from "@clerk/nextjs/server";
 import { eq } from "drizzle-orm";
 import { headers } from "next/headers";
 import { db } from "@/db";
 import { orgs, users } from "@/db/schema";
+import { AuthError } from "@/lib/auth-error";
+import { isGuestClerkId, resolveGuestUser } from "@/lib/guest-auth";
 
 export type AppUser = typeof users.$inferSelect;
+export { AuthError };
+
+export type ActorContext = {
+  user: AppUser;
+  /** Present when authenticated via guest magic-link cookie (not Clerk). */
+  guestSessionId: string | null;
+};
 
 type AuthIdentity = {
   clerkId: string;
@@ -55,10 +66,16 @@ async function resolveIdentity(): Promise<AuthIdentity | null> {
   };
 }
 
-/** Resolve the authenticated app user, creating org + user rows on first request. */
+/**
+ * Resolve Clerk (or dev) app user — never a guest.
+ * Prefer {@link requireActor} for session APIs that guests may call.
+ */
 export async function requireAppUser(): Promise<AppUser> {
   const identity = await resolveIdentity();
   if (!identity) {
+    throw new AuthError("Unauthorized", 401);
+  }
+  if (isGuestClerkId(identity.clerkId)) {
     throw new AuthError("Unauthorized", 401);
   }
 
@@ -119,14 +136,25 @@ export async function requireAppUser(): Promise<AppUser> {
   return created;
 }
 
-export class AuthError extends Error {
-  status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = "AuthError";
-    this.status = status;
+/**
+ * Clerk member OR guest magic-link cookie.
+ * Org settings / create-session must keep using {@link requireAppUser}.
+ */
+export async function requireActor(): Promise<ActorContext> {
+  try {
+    const user = await requireAppUser();
+    return { user, guestSessionId: null };
+  } catch (error) {
+    if (!(error instanceof AuthError) || error.status !== 401) {
+      throw error;
+    }
   }
+
+  const guest = await resolveGuestUser();
+  if (!guest) {
+    throw new AuthError("Unauthorized", 401);
+  }
+  return { user: guest.user, guestSessionId: guest.sessionId };
 }
 
 export function jsonError(error: unknown) {
@@ -134,5 +162,31 @@ export function jsonError(error: unknown) {
     return Response.json({ error: error.message }, { status: error.status });
   }
   console.error(error);
+  const message = error instanceof Error ? error.message : "Internal server error";
+  if (message.includes("ANTHROPIC_API_KEY") || message.includes("ANTHROPIC_AUTH_TOKEN")) {
+    return Response.json({ error: message }, { status: 503 });
+  }
+  const statusCode =
+    typeof error === "object" &&
+    error !== null &&
+    "statusCode" in error &&
+    typeof (error as { statusCode: unknown }).statusCode === "number"
+      ? (error as { statusCode: number }).statusCode
+      : undefined;
+  if (statusCode === 401 || statusCode === 403) {
+    return Response.json(
+      {
+        error:
+          "Anthropic authentication failed. Set a valid ANTHROPIC_API_KEY in .env.local and restart the dev server.",
+      },
+      { status: 503 }
+    );
+  }
+  if (statusCode && statusCode >= 400 && statusCode < 600) {
+    return Response.json(
+      { error: message || `Upstream model error (${statusCode})` },
+      { status: 502 }
+    );
+  }
   return Response.json({ error: "Internal server error" }, { status: 500 });
 }

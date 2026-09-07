@@ -1,8 +1,10 @@
-import { and, asc, eq, gt, max } from "drizzle-orm";
-import { db } from "@/db";
-import { sessionEvents, sessions } from "@/db/schema";
-import { AuthError, jsonError, requireAppUser } from "@/lib/auth";
-import { canWriteUserMessage, requireSessionAccess } from "@/lib/sessions";
+import { jsonError, requireActor } from "@/lib/auth";
+import { runAgentTurn } from "@/lib/agent-loop";
+import { assertOrgBudgetAllowsNewWork } from "@/lib/budget";
+import { maybeRaiseCheckpointForUserMessage } from "@/lib/checkpoints";
+import { appendSessionEvent, listSessionEvents } from "@/lib/events";
+import { requireSessionPermission } from "@/lib/rbac";
+import { requireSessionAccess } from "@/lib/sessions";
 
 type RouteContext = {
   params: Promise<{ id: string }>;
@@ -11,9 +13,9 @@ type RouteContext = {
 /** GET /api/sessions/:id/events?since=N — events with sequence_number > N (default 0). */
 export async function GET(request: Request, context: RouteContext) {
   try {
-    const user = await requireAppUser();
+    const actor = await requireActor();
     const { id: sessionId } = await context.params;
-    await requireSessionAccess(user, sessionId);
+    await requireSessionAccess(actor.user, sessionId, actor.guestSessionId);
 
     const { searchParams } = new URL(request.url);
     const sinceParam = searchParams.get("since");
@@ -28,17 +30,7 @@ export async function GET(request: Request, context: RouteContext) {
       }
     }
 
-    const events = await db
-      .select()
-      .from(sessionEvents)
-      .where(
-        and(
-          eq(sessionEvents.sessionId, sessionId),
-          gt(sessionEvents.sequenceNumber, since)
-        )
-      )
-      .orderBy(asc(sessionEvents.sequenceNumber));
-
+    const events = await listSessionEvents(sessionId, since);
     return Response.json({ events });
   } catch (error) {
     return jsonError(error);
@@ -46,22 +38,22 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 /**
- * POST /api/sessions/:id/events — append a user_message.
- * sequence_number is assigned under a row lock on sessions so concurrent
- * appends cannot collide or leave gaps.
+ * POST /api/sessions/:id/events — append a user_message, then run the
+ * single-agent loop which appends an agent_message via the same sequencer.
+ * Keyword policies may raise a checkpoint and skip the agent turn.
  */
 export async function POST(request: Request, context: RouteContext) {
   try {
-    const user = await requireAppUser();
+    const actor = await requireActor();
     const { id: sessionId } = await context.params;
-    const { membership } = await requireSessionAccess(user, sessionId);
+    const { session } = await requireSessionPermission(
+      actor.user,
+      sessionId,
+      "user_message.write",
+      actor.guestSessionId
+    );
 
-    if (!canWriteUserMessage(membership.role)) {
-      throw new AuthError(
-        "Forbidden: role cannot append user_message events",
-        403
-      );
-    }
+    await assertOrgBudgetAllowsNewWork(session.orgId);
 
     const body = (await request.json().catch(() => null)) as {
       event_type?: unknown;
@@ -86,41 +78,50 @@ export async function POST(request: Request, context: RouteContext) {
       );
     }
 
-    const event = await db.transaction(async (tx) => {
-      // Serialize appends for this session (also verifies the session still exists).
-      const locked = await tx
-        .select({ id: sessions.id })
-        .from(sessions)
-        .where(eq(sessions.id, sessionId))
-        .for("update");
+    const payload = body.payload as Record<string, unknown>;
+    const content =
+      typeof payload.content === "string" ? payload.content.trim() : "";
 
-      if (locked.length === 0) {
-        throw new AuthError("Session not found", 404);
-      }
-
-      const [agg] = await tx
-        .select({ maxSeq: max(sessionEvents.sequenceNumber) })
-        .from(sessionEvents)
-        .where(eq(sessionEvents.sessionId, sessionId));
-
-      const sequenceNumber = (agg?.maxSeq ?? 0) + 1;
-
-      const [created] = await tx
-        .insert(sessionEvents)
-        .values({
-          sessionId,
-          sequenceNumber,
-          eventType: "user_message",
-          actorId: user.id,
-          actorType: "human",
-          payload: body.payload,
-        })
-        .returning();
-
-      return created;
+    const event = await appendSessionEvent({
+      sessionId,
+      eventType: "user_message",
+      actorId: actor.user.id,
+      actorType: "human",
+      payload,
     });
 
-    return Response.json({ event }, { status: 201 });
+    const { paused, checkpoint } = await maybeRaiseCheckpointForUserMessage({
+      sessionId,
+      orgId: session.orgId,
+      actorId: actor.user.id,
+      userMessageEvent: event,
+      content,
+    });
+
+    if (paused) {
+      return Response.json(
+        { event, checkpoint, paused: true, agentEvent: null },
+        { status: 201 }
+      );
+    }
+
+    const turn = await runAgentTurn(sessionId);
+    if (turn.paused) {
+      return Response.json(
+        {
+          event,
+          checkpoint: turn.checkpoint,
+          paused: true,
+          agentEvent: null,
+        },
+        { status: 201 }
+      );
+    }
+
+    return Response.json(
+      { event, agentEvent: turn.event, paused: false },
+      { status: 201 }
+    );
   } catch (error) {
     return jsonError(error);
   }
